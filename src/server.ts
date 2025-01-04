@@ -1,5 +1,5 @@
 import * as dotenv from "dotenv";
-import express, { Request, Response } from "express";
+import express, { Request, response, Response } from "express";
 import mongoose from "mongoose";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -25,6 +25,14 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected successfully"))
   .catch((err) => console.error("MongoDB connection error:", err));
+
+redis.on("connect", () => {
+  console.log("Connected to Redis");
+});
+
+redis.on("error", (err) => {
+  console.error("Redis connection error:", err);
+});
 
 // Utility Functions
 const clearRecipeCache = async () => {
@@ -76,34 +84,43 @@ app.post("/recipes", async (req: Request, res: Response) => {
 
 // Fetch Paginated Recipes with Filters
 app.get("/recipes", async (req: Request, res: Response) => {
-  const { page = 1, pageSize = 10 } = req.query;
-
+  const { page = 1 } = req.query;
+  const pageSize = Math.min(Number(req.query.pageSize) || 10, 100);
   const search = typeof req.query.search === "string" ? req.query.search : "";
-  const difficulty = typeof req.query.difficulty === "string" ? req.query.difficulty : "";
+  const difficulty =
+    typeof req.query.difficulty === "string" ? req.query.difficulty : "";
+  const cacheKey = `recipes:page=${page}&pageSize=${pageSize}&search=${search}&difficulty=${difficulty}`;
 
-  const query: any = {};
-
-  if (difficulty) query.difficulty = { $regex: new RegExp(difficulty, "i") };
+  const query: any = {
+    ...(difficulty && { difficulty: { $regex: new RegExp(difficulty, "i") } }),
+    $or: [
+      { title: { $regex: new RegExp(search, "i") } },
+      { "ingredients.name": { $regex: new RegExp(search, "i") } },
+    ],
+  };
 
   try {
+    // Check Redis cache
+    try {
+      const cachedData = await redis.get(cacheKey);
+      if (cachedData) {
+        return res.json(JSON.parse(cachedData));
+      }
+    } catch (err) {
+      console.error("Redis fetch error:", err);
+    }
+
+    // Fetch from database if not in cache
     const results = await Recipe.aggregate([
       // Match recipes by difficulty or search
-      {
-        $match: {
-          $or: [
-            { title: { $regex: new RegExp(search, "i") } },
-            { "ingredients.name": { $regex: new RegExp(search, "i") } }, // Match ingredient names
-          ],
-          ...query, // Include difficulty filter
-        },
-      },
+      { $match: query },
       // Project the fields you want
       {
         $facet: {
           recipes: [
             { $sort: { title: 1 } },
-            { $skip: (Number(page) - 1) * Number(pageSize) },
-            { $limit: Number(pageSize) },
+            { $skip: (Number(page) - 1) * pageSize },
+            { $limit: pageSize },
             {
               $project: {
                 title: 1,
@@ -124,16 +141,22 @@ app.get("/recipes", async (req: Request, res: Response) => {
     const totalRecipes = results[0]?.totalCount[0]?.count || 0;
     const totalPages = Math.ceil(totalRecipes / Number(pageSize));
 
-    res.json({ recipes, totalRecipes, totalPages, currentPage: page });
+    const cacheValue = { recipes, totalRecipes, totalPages, currentPage: page };
+    try {
+      await redis.set(cacheKey, JSON.stringify(cacheValue), "EX", 3600);
+    } catch (err) {
+      console.error("Redis set error:", err);
+    }
+
+    res.json(cacheValue);
   } catch (error) {
     console.error("Error fetching recipes:", error);
-    res.status(500).json({ error: "Failed to fetch recipes", details: (error as any).message });
+    res.status(500).json({
+      error: "Failed to fetch recipes",
+      details: (error as any).message,
+    });
   }
 });
-
-
-
-
 
 // Fetch a Single Recipe by ID
 app.get("/recipes/:id", async (req: Request, res: Response) => {
@@ -161,7 +184,6 @@ app.get("/recipes/:id", async (req: Request, res: Response) => {
 // Update a Recipe by ID
 app.put("/recipes/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
-
   try {
     const updatedRecipe = await Recipe.findByIdAndUpdate(id, req.body, {
       new: true,
@@ -201,6 +223,30 @@ app.delete("/recipes/:id", async (req: Request, res: Response) => {
 });
 
 // Start Server
-app.listen(port, '0.0.0.0',1,() => {
+app.listen(port, "0.0.0.0", () => {
   console.log(`Server is running on port: ${port}`);
+});
+
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
+
+process.on("SIGINT", async () => {
+  console.log("Closing server...");
+  await mongoose.disconnect();
+  redis.disconnect();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("Closing server...");
+  await mongoose.disconnect();
+  redis.disconnect();
+  process.exit(0);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+  // Optional: Send logs to a monitoring service or shut down gracefully
 });
