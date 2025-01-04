@@ -1,1 +1,4 @@
 node_modules
+/backup_directory
+.env
+src/migrateIngredients.ts
